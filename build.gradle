@@ -1,0 +1,22 @@
+plugins {
+    id 'application'
+}
+
+group = 'com.pinnacle'
+version = '0.1.0-alpha'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+application {
+    mainClass = 'com.pinnacle.mcstats.MinecraftServerStatsApp'
+}
+
+jar {
+    manifest {
+        attributes 'Main-Class': application.mainClass
+    }
+}

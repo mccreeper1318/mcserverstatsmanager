@@ -3,16 +3,24 @@ package com.pinnacle.mcstats;
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import javax.swing.table.DefaultTableModel;
+import javax.swing.table.TableRowSorter;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import java.awt.*;
 import java.awt.datatransfer.DataFlavor;
 import java.io.File;
 import java.io.IOException;
+import java.net.URI;
+import java.net.URLEncoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.*;
 import java.util.List;
+import java.util.regex.Pattern;
 
 public class MinecraftServerStatsApp extends JFrame {
     private final CardLayout cards = new CardLayout();
@@ -22,6 +30,9 @@ public class MinecraftServerStatsApp extends JFrame {
     private McServer currentServer;
     private Member currentMember;
     private boolean deleteMode = false;
+    private final HttpClient httpClient = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(8))
+            .build();
 
     public MinecraftServerStatsApp() {
         super("Minecraft Server Stats Manager");
@@ -214,6 +225,20 @@ public class MinecraftServerStatsApp extends JFrame {
         report.setLineWrap(true);
         report.setWrapStyleWord(true);
         report.setText("Waiting for .json files...\n\nExample filename: 12345678-1234-1234-1234-123456789abc.json");
+        DefaultListModel<File> queuedFiles = new DefaultListModel<>();
+        JList<File> fileList = new JList<>(queuedFiles);
+        fileList.setCellRenderer((list, value, index, isSelected, cellHasFocus) -> {
+            JLabel label = new JLabel(value.getName() + "  (" + value.getAbsolutePath() + ")");
+            if (isSelected) {
+                label.setOpaque(true);
+                label.setBackground(list.getSelectionBackground());
+                label.setForeground(list.getSelectionForeground());
+            }
+            return label;
+        });
+        JProgressBar progressBar = new JProgressBar(0, 100);
+        progressBar.setStringPainted(true);
+        progressBar.setString("No files queued");
 
         JPanel dropZone = new JPanel(new BorderLayout());
         dropZone.setBorder(BorderFactory.createDashedBorder(Color.GRAY, 2f, 8f, 6f, true));
@@ -234,7 +259,9 @@ public class MinecraftServerStatsApp extends JFrame {
                 try {
                     @SuppressWarnings("unchecked")
                     List<File> files = (List<File>) support.getTransferable().getTransferData(DataFlavor.javaFileListFlavor);
-                    report.setText(updateStatsFromFiles(server, files));
+                    addFilesToQueue(queuedFiles, files);
+                    progressBar.setValue(0);
+                    progressBar.setString(queuedFiles.isEmpty() ? "No files queued" : queuedFiles.size() + " file(s) queued");
                     return true;
                 } catch (Exception ex) {
                     report.setText("Could not read dropped files:\n" + ex.getMessage());
@@ -245,7 +272,11 @@ public class MinecraftServerStatsApp extends JFrame {
 
         JPanel center = new JPanel(new BorderLayout(12, 12));
         center.add(dropZone, BorderLayout.NORTH);
-        center.add(new JScrollPane(report), BorderLayout.CENTER);
+        center.add(new JScrollPane(fileList), BorderLayout.CENTER);
+        JPanel reportAndProgress = new JPanel(new BorderLayout(8, 8));
+        reportAndProgress.add(progressBar, BorderLayout.NORTH);
+        reportAndProgress.add(new JScrollPane(report), BorderLayout.CENTER);
+        center.add(reportAndProgress, BorderLayout.SOUTH);
         content.add(center, BorderLayout.CENTER);
         panel.add(content, BorderLayout.CENTER);
 
@@ -261,16 +292,28 @@ public class MinecraftServerStatsApp extends JFrame {
             chooser.setFileFilter(new FileNameExtensionFilter("Minecraft stat JSON files", "json"));
             int result = chooser.showOpenDialog(this);
             if (result == JFileChooser.APPROVE_OPTION) {
-                report.setText(updateStatsFromFiles(server, Arrays.asList(chooser.getSelectedFiles())));
+                addFilesToQueue(queuedFiles, Arrays.asList(chooser.getSelectedFiles()));
+                progressBar.setValue(0);
+                progressBar.setString(queuedFiles.isEmpty() ? "No files queued" : queuedFiles.size() + " file(s) queued");
             }
         });
-        bottom.add(chooseFiles, BorderLayout.EAST);
+        JPanel rightActions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+        JButton process = new JButton("Process Queued Files");
+        process.addActionListener(e -> {
+            List<File> files = Collections.list(queuedFiles.elements());
+            report.setText(updateStatsFromFiles(server, files, progressBar));
+            queuedFiles.clear();
+            progressBar.setString("Done");
+        });
+        rightActions.add(chooseFiles);
+        rightActions.add(process);
+        bottom.add(rightActions, BorderLayout.EAST);
 
         panel.add(bottom, BorderLayout.SOUTH);
         setScreen("bulkUpdateStats", panel);
     }
 
-    private String updateStatsFromFiles(McServer server, List<File> files) {
+    private String updateStatsFromFiles(McServer server, List<File> files, JProgressBar progressBar) {
         if (files == null || files.isEmpty()) {
             return "No files were selected.";
         }
@@ -281,7 +324,11 @@ public class MinecraftServerStatsApp extends JFrame {
         report.append("Update Results for ").append(server.name).append("\n");
         report.append("=".repeat(Math.max(24, server.name.length() + 19))).append("\n\n");
 
-        for (File file : files) {
+        for (int i = 0; i < files.size(); i++) {
+            File file = files.get(i);
+            int pct = (int) (((double) i / Math.max(1, files.size())) * 100);
+            progressBar.setValue(pct);
+            progressBar.setString("Processing " + (i + 1) + " / " + files.size());
             if (file == null || !file.isFile()) {
                 skipped++;
                 report.append("Skipped: not a readable file.\n");
@@ -304,9 +351,14 @@ public class MinecraftServerStatsApp extends JFrame {
 
             Member target = findMemberByUuid(server, uuidFromFile);
             if (target == null) {
-                skipped++;
-                report.append("Skipped ").append(fileName).append(": no member on this server has UUID ").append(uuidFromFile).append(".\n");
-                continue;
+                target = createMemberFromUuid(server, uuidFromFile);
+                if (target == null) {
+                    skipped++;
+                    report.append("Skipped ").append(fileName).append(": no member on this server has UUID ").append(uuidFromFile)
+                            .append(" and Mojang lookup failed.\n");
+                    continue;
+                }
+                report.append("Created new member ").append(target.name).append(" (").append(target.uuid).append(") from Mojang profile lookup.\n");
             }
 
             try {
@@ -326,6 +378,7 @@ public class MinecraftServerStatsApp extends JFrame {
                 report.append("Skipped ").append(fileName).append(": ").append(ex.getMessage()).append("\n");
             }
         }
+        progressBar.setValue(100);
 
         if (updated > 0) {
             saveData();
@@ -336,6 +389,14 @@ public class MinecraftServerStatsApp extends JFrame {
             report.append("\nStats are saved. Go back and open a member to see the updated table.");
         }
         return report.toString();
+    }
+
+    private void addFilesToQueue(DefaultListModel<File> queue, List<File> files) {
+        for (File file : files) {
+            if (file != null && file.isFile() && file.getName().toLowerCase(Locale.ROOT).endsWith(".json")) {
+                queue.addElement(file);
+            }
+        }
     }
 
     private String uuidFromFileName(String fileName) {
@@ -420,7 +481,29 @@ public class MinecraftServerStatsApp extends JFrame {
         JTable table = new JTable();
         table.setAutoCreateRowSorter(true);
         table.setModel(statsTableModel(member));
-        content.add(new JScrollPane(table), BorderLayout.CENTER);
+        TableRowSorter<DefaultTableModel> sorter = new TableRowSorter<>((DefaultTableModel) table.getModel());
+        table.setRowSorter(sorter);
+        JTextField searchField = new JTextField();
+        searchField.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+            private void apply() {
+                String q = searchField.getText().trim();
+                if (q.isEmpty()) {
+                    sorter.setRowFilter(null);
+                } else {
+                    sorter.setRowFilter(RowFilter.regexFilter("(?i)" + Pattern.quote(q), 0));
+                }
+            }
+            @Override public void insertUpdate(javax.swing.event.DocumentEvent e) { apply(); }
+            @Override public void removeUpdate(javax.swing.event.DocumentEvent e) { apply(); }
+            @Override public void changedUpdate(javax.swing.event.DocumentEvent e) { apply(); }
+        });
+        JPanel tableArea = new JPanel(new BorderLayout(8, 8));
+        JPanel searchPanel = new JPanel(new BorderLayout(6, 6));
+        searchPanel.add(new JLabel("Search Stat:"), BorderLayout.WEST);
+        searchPanel.add(searchField, BorderLayout.CENTER);
+        tableArea.add(searchPanel, BorderLayout.NORTH);
+        tableArea.add(new JScrollPane(table), BorderLayout.CENTER);
+        content.add(tableArea, BorderLayout.CENTER);
         panel.add(content, BorderLayout.CENTER);
 
         JPanel bottom = new JPanel(new BorderLayout());
@@ -512,6 +595,38 @@ public class MinecraftServerStatsApp extends JFrame {
             JOptionPane.showMessageDialog(this, "Could not save data:\n" + ex.getMessage(),
                     "Save Error", JOptionPane.ERROR_MESSAGE);
         }
+    }
+
+    private Member createMemberFromUuid(McServer server, String normalizedUuid) {
+        try {
+            String mojangName = fetchMojangNameByUuid(normalizedUuid);
+            if (mojangName == null || mojangName.isBlank()) {
+                return null;
+            }
+            Member member = new Member(UUID.randomUUID().toString(), mojangName, normalizedUuid);
+            server.members.add(member);
+            return member;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private String fetchMojangNameByUuid(String uuid) throws IOException, InterruptedException {
+        String clean = normalizeUuid(uuid);
+        if (clean.length() != 32) return null;
+        String url = "https://api.mojang.com/user/profile/" + URLEncoder.encode(clean, StandardCharsets.UTF_8);
+        HttpRequest req = HttpRequest.newBuilder(URI.create(url))
+                .timeout(Duration.ofSeconds(10))
+                .GET()
+                .build();
+        HttpResponse<String> response = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() != 200) return null;
+        Object parsed = SimpleJson.parse(response.body());
+        if (parsed instanceof Map<?, ?> map) {
+            Object name = map.get("name");
+            if (name != null) return String.valueOf(name);
+        }
+        return null;
     }
 
     public static void main(String[] args) {
